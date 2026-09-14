@@ -79,15 +79,11 @@ jobs:
 
           echo "=== ensure $EGRESS_COUNT secondary private IPs ==="
           # Hyphenated keys must be quoted in jmespath.
-          PRIV_IPS=$(oci network private-ip list --vnic-id "$VNIC_ID" --no-retry \
-            --query 'data[?"is-primary"==`false`].id' --raw-output || true)
-          # oci returns one id per line with --raw-output on list; normalize to array
-          mapfile -t PRIV_ARR <<< "$PRIV_IPS"
-          # filter empties/None
-          TMP=(); for p in "${PRIV_ARR[@]}"; do
-            if [ -n "$p" ] && [ "$p" != "None" ]; then TMP+=("$p"); fi
-          done
-          PRIV_ARR=("${TMP[@]}")
+          # --raw-output still emits a JSON array for multi-value projections
+          # (brackets, quotes, commas) — parse it so PRIV_ARR holds bare IDs.
+          mapfile -t PRIV_ARR < <(oci network private-ip list --vnic-id "$VNIC_ID" --no-retry \
+            --query 'data[?"is-primary"==`false`].id' --output json \
+            | python3 -c "import json,sys; [print(p) for p in json.load(sys.stdin)]")
           echo "existing secondary: ${#PRIV_ARR[@]}"
 
           i=0
@@ -102,7 +98,7 @@ jobs:
           done
 
           echo "=== list egress reserved public IPs (skip protected $PROTECTED_IP) ==="
-          PUB_JSON=$(oci network public-ip list --scope REGION \
+          PUB_JSON=$(oci network public-ip list --scope REGION --all \
             --compartment-id "$TENANCY" --no-retry \
             --query "data[?\"lifetime\"=='RESERVED' && \"lifecycle-state\"=='ASSIGNED' && \"ip-address\"!='$PROTECTED_IP']" \
             --output json)
