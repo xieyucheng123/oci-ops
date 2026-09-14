@@ -65,14 +65,17 @@ jobs:
           echo "instance: $INSTANCE_ID"
 
           echo "=== primary VNIC ==="
+          # NOTE: vnic-attachment has no is-primary field; nic-index 0 is primary.
+          # Hyphenated keys must be quoted in jmespath.
           VNIC_ID=$(oci compute vnic-attachment list \
             --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --no-retry \
-            --query 'data[?is-primary==`true`] | [0]."vnic-id"' --raw-output)
+            --query 'data[?"nic-index"==`0`] | [0]."vnic-id"' --raw-output)
           echo "vnic: $VNIC_ID"
 
           echo "=== ensure $EGRESS_COUNT secondary private IPs ==="
+          # Hyphenated keys must be quoted in jmespath.
           PRIV_IPS=$(oci network private-ip list --vnic-id "$VNIC_ID" --no-retry \
-            --query 'data[?is-primary==`false`].id' --raw-output || true)
+            --query 'data[?"is-primary"==`false`].id' --raw-output || true)
           # oci returns one id per line with --raw-output on list; normalize to array
           mapfile -t PRIV_ARR <<< "$PRIV_IPS"
           # filter empties/None

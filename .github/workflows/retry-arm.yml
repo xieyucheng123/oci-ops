@@ -273,6 +273,37 @@ jobs:
               workflow_id: 'retry-arm.yml'
             });
 
+      - name: Round summary
+        # Always runs: makes no_capacity / rate_limited / skipped visible on the
+        # run page instead of guessing from a bare "success" conclusion.
+        if: always()
+        env:
+          VM_EXISTS: ${{ steps.check.outputs.exists }}
+          ROUND_STATUS: ${{ steps.launch.outputs.status }}
+          ROUND_INSTANCE: ${{ steps.launch.outputs.instance_id }}
+          ROUND_SHAPE: ${{ steps.launch.outputs.shape_label }}
+          ROUND_ERR_CODE: ${{ steps.launch.outputs.error_code }}
+          ROUND_ERR_MSG: ${{ steps.launch.outputs.error_msg }}
+        run: |
+          {
+            echo "## Retry round: $(date -u +%FT%TZ)"
+            echo ""
+            if [ "$VM_EXISTS" = "true" ]; then
+              echo "- Result: **skipped** (vm-arm already RUNNING)"
+            elif [ "$ROUND_STATUS" = "success" ]; then
+              echo "- Result: **created** \`$ROUND_INSTANCE\` ($ROUND_SHAPE)"
+            elif [ "$ROUND_STATUS" = "already_exists" ]; then
+              echo "- Result: **already exists** (appeared mid-run)"
+            elif [ -n "$ROUND_STATUS" ]; then
+              echo "- Result: \`$ROUND_STATUS\` (150 attempts, no capacity)"
+              if [ -n "$ROUND_ERR_CODE" ]; then
+                echo "- Last error: \`$ROUND_ERR_CODE\` — $ROUND_ERR_MSG"
+              fi
+            else
+              echo "- Result: \`unknown\` (launch step did not run)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Create error issue
         if: steps.launch.outputs.status == 'error'
         uses: actions/github-script@v7
