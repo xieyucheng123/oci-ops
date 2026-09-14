@@ -53,6 +53,7 @@ jobs:
         # 10 spaces in this file (= col 0 for the runner); deeper indent
         # causes IndentationError, shallower breaks YAML parsing.
         # Hyphenated jmespath keys must be quoted: data[?"nic-index"==`0`].
+        # oci create/get responses are wrapped in a data{} envelope.
         run: |
           set -e
           TENANCY="${{ secrets.OCI_CLI_TENANCY }}"
@@ -157,10 +158,14 @@ jobs:
             NEWDATA=$(oci network public-ip create --compartment-id "$TENANCY" \
               --lifetime RESERVED --display-name "egress-$(date +%s)-$try" \
               --private-ip-id "$VICTIM_PRIV" --no-retry \
-              --query '{id:id, ip:"ip-address"}' --output json)
+              --query 'data.{id:id, ip:"ip-address"}' --output json)
             NEW_IP=$(echo "$NEWDATA" | python3 -c "import json,sys; print(json.load(sys.stdin)['ip'])")
             NEW_ID=$(echo "$NEWDATA" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
             echo "got: $NEW_IP ($NEW_ID)"
+            if ! echo "$NEW_IP" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::create returned invalid IP '$NEW_IP' (id: $NEW_ID), aborting before history commit"
+              exit 1
+            fi
             DUP=$(echo "$HIST" | python3 -c "
           import json,sys
           h=json.load(sys.stdin)
