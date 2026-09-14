@@ -48,6 +48,11 @@ jobs:
           chmod 600 ~/.oci/config
 
       - name: Rotate one egress IP (rolling, dedup)
+        # MAINTAINER NOTE: YAML strips this run: block's 10-space base indent
+        # before the runner sees it. Embedded python MUST start at exactly
+        # 10 spaces in this file (= col 0 for the runner); deeper indent
+        # causes IndentationError, shallower breaks YAML parsing.
+        # Hyphenated jmespath keys must be quoted: data[?"nic-index"==`0`].
         run: |
           set -e
           TENANCY="${{ secrets.OCI_CLI_TENANCY }}"
@@ -116,10 +121,10 @@ jobs:
             echo "no egress public IP yet, assigning fresh ones to secondaries without public IP..."
             for priv in "${PRIV_ARR[@]}"; do
               HAS=$(echo "$PUB_JSON" | python3 -c "
-              import json,sys
-              pubs=json.load(sys.stdin)
-              print(sum(1 for p in pubs if p.get('private-ip-id')=='$priv'))
-              ")
+          import json,sys
+          pubs=json.load(sys.stdin)
+          print(sum(1 for p in pubs if p.get('private-ip-id')=='$priv'))
+          ")
               if [ "$HAS" = "0" ]; then
                 echo "assign new reserved IP to $priv"
                 oci network public-ip create --compartment-id "$TENANCY" \
@@ -161,10 +166,10 @@ jobs:
             NEW_ID=$(echo "$NEWDATA" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
             echo "got: $NEW_IP ($NEW_ID)"
             DUP=$(echo "$HIST" | python3 -c "
-            import json,sys
-            h=json.load(sys.stdin)
-            print('yes' if '$NEW_IP' in h or '$NEW_IP'=='$VICTIM_IP' else 'no')
-            ")
+          import json,sys
+          h=json.load(sys.stdin)
+          print('yes' if '$NEW_IP' in h or '$NEW_IP'=='$VICTIM_IP' else 'no')
+          ")
             if [ "$DUP" = "no" ]; then
               echo "fresh IP accepted: $NEW_IP"
               VICTIM_ID="$NEW_ID"
