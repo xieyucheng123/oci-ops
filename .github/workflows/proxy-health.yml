@@ -1,0 +1,275 @@
+name: Proxy Health Check (daily deep probe)
+
+# vm-proxy (OCI Tokyo free tier) 会周期性网络栈退化：TCP 建连大面积超时，
+# OCI API 显示仍是 RUNNING，SSH 也 reset，只能重启恢复（2026-09-16 实证）。
+# 本流水线每天北京时间 6 点做一次深度巡检：runner 内起 sing-box 客户端，
+# 经 VLESS 做 6 轮真实拨测，>=5 轮失败则开 tracking issue 并 RESET 重启，
+# 恢复后自动关 issue，24 小时冷却，支持手动触发。
+# 与 retry-arm.yml / rotate-egress.yml 相互独立：不同文件、不同 cron、
+# 不同 concurrency group。
+
+on:
+  schedule:
+    # 每天 06:00 CST = 22:00 UTC；错开 retry-arm(整点) 与 rotate-egress(17分)
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+    inputs:
+      force_reboot:
+        description: '跳过拨测直接重启 vm-proxy（应急用）'
+        required: false
+        default: 'false'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  proxy-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: proxy-health
+      cancel-in-progress: false
+    env:
+      INSTANCE_DISPLAY_NAME: vm-proxy
+      PROBE_TARGET: https://opencode.ai
+      PROBE_ROUNDS: 6
+      PROBE_INTERVAL: 120
+      FAIL_THRESHOLD: 5
+      VERIFY_ROUNDS: 3
+      COOLDOWN_HOURS: 24
+      ISSUE_LABEL: proxy-health
+      REALITY_SERVER_NAME: www.apple.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: pip install oci-cli --quiet
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/config << 'EOF'
+          [DEFAULT]
+          user=${{ secrets.OCI_CLI_USER }}
+          fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_CLI_TENANCY }}
+          region=${{ secrets.OCI_CLI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          echo "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/config
+
+      - name: Resolve vm-proxy instance + public IP
+        id: resolve
+        run: |
+          set -e
+          TENANCY="${{ secrets.OCI_CLI_TENANCY }}"
+          NAME="$INSTANCE_DISPLAY_NAME"
+          IID=$(oci compute instance list --compartment-id "$TENANCY" --all --no-retry \
+            --query "data[?\"display-name\"==\`$NAME\` && \"lifecycle-state\"==\`RUNNING\`] | [0].id" \
+            --raw-output)
+          if [ -z "$IID" ] || [ "$IID" = "None" ]; then
+            echo "vm-proxy not RUNNING, abort"; exit 1
+          fi
+          echo "instance_id=$IID" >> $GITHUB_OUTPUT
+          VNIC=$(oci compute instance list-vnics --instance-id "$IID" --no-retry \
+            --query 'data[?"is-primary"==`true`] | [0].id' --raw-output)
+          IP=$(oci network vnic get --vnic-id "$VNIC" --no-retry \
+            --query 'data."public-ip"' --raw-output)
+          if [ -z "$IP" ] || [ "$IP" = "None" ]; then
+            echo "no public IP, abort"; exit 1
+          fi
+          echo "public_ip=$IP" >> $GITHUB_OUTPUT
+          echo "vm-proxy $IID @ $IP"
+
+      - name: Install sing-box client
+        run: |
+          set -e
+          TAG=$(curl -sL --max-time 30 https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")
+          echo "sing-box $TAG"
+          curl -sL --max-time 120 -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${TAG#v}-linux-amd64.tar.gz"
+          mkdir -p /tmp/sing-box && tar -xzf /tmp/sing-box.tar.gz -C /tmp/sing-box
+          find /tmp/sing-box -name sing-box -type f -exec cp {} /tmp/sing-box-bin \;
+          chmod +x /tmp/sing-box-bin
+          /tmp/sing-box-bin version
+
+      - name: Deep probe (6 rounds via VLESS)
+        id: probe
+        env:
+          PROXY_IP: ${{ steps.resolve.outputs.public_ip }}
+          VLESS_UUID: ${{ secrets.PROXY_VLESS_UUID }}
+          REALITY_PBKEY: ${{ secrets.PROXY_REALITY_PBKEY }}
+          REALITY_SHORT_ID: ${{ secrets.PROXY_REALITY_SHORT_ID }}
+        run: |
+          set -e
+          python3 - "$PROXY_IP" "$VLESS_UUID" "$REALITY_PBKEY" "$REALITY_SHORT_ID" "$REALITY_SERVER_NAME" << 'EOF'
+          import json, sys
+          ip, uuid, pbkey, sid, sni = sys.argv[1:6]
+          cfg = {
+            "inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": 2080, "tag": "mixed-in"}],
+            "outbounds": [{
+              "type": "vless", "tag": "proxy",
+              "server": ip, "server_port": 443, "uuid": uuid,
+              "flow": "xtls-rprx-vision",
+              "tls": {"enabled": True, "server_name": sni,
+                "reality": {"enabled": True, "public_key": pbkey, "short_id": sid},
+                "utls": {"enabled": True, "fingerprint": "chrome"}}
+            }],
+            "route": {"final": "proxy"}
+          }
+          json.dump(cfg, open("/tmp/sb-client.json", "w"))
+          EOF
+          /tmp/sing-box-bin -c /tmp/sb-client.json check && echo "client config OK"
+          /tmp/sing-box-bin run -c /tmp/sb-client.json > /tmp/sb-client.log 2>&1 &
+          echo $! > /tmp/sb.pid
+          sleep 5
+          FAILS=0
+          LOG=/tmp/probe.log
+          : > "$LOG"
+          for i in $(seq 1 "$PROBE_ROUNDS"); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -x http://127.0.0.1:2080 \
+              --max-time 20 "$PROBE_TARGET" 2>/dev/null || echo "000")
+            echo "round $i/$PROBE_ROUNDS: HTTP $CODE" | tee -a "$LOG"
+            [ "$CODE" = "200" ] || FAILS=$((FAILS + 1))
+            [ "$i" = "$PROBE_ROUNDS" ] || sleep "$PROBE_INTERVAL"
+          done
+          kill "$(cat /tmp/sb.pid)" 2>/dev/null || true
+          echo "fail_count=$FAILS" >> $GITHUB_OUTPUT
+          echo "FAILED $FAILS/$PROBE_ROUNDS rounds"
+
+      - name: Decide / issue / reboot / verify
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAIL_COUNT: ${{ steps.probe.outputs.fail_count }}
+          INSTANCE_ID: ${{ steps.resolve.outputs.instance_id }}
+          FORCE_REBOOT: ${{ inputs.force_reboot }}
+        run: |
+          set -e
+          FAIL_COUNT="${FAIL_COUNT:-0}"
+          python3 << 'EOF'
+          import json, os, subprocess, time
+
+          FAIL = int(os.environ["FAIL_COUNT"])
+          TH = int(os.environ["FAIL_THRESHOLD"])
+          IID = os.environ["INSTANCE_ID"]
+          FORCE = os.environ.get("FORCE_REBOOT", "false") == "true"
+          LABEL = os.environ["ISSUE_LABEL"]
+          COOLDOWN = int(os.environ["COOLDOWN_HOURS"]) * 3600
+          TARGET = os.environ["PROBE_TARGET"]
+
+          def gh(*args):
+            r = subprocess.run(["gh"] + list(args), capture_output=True, text=True)
+            return r.stdout.strip()
+
+          def oci(*args):
+            r = subprocess.run(["oci"] + list(args), capture_output=True, text=True)
+            if r.returncode != 0:
+              raise RuntimeError(r.stderr[-500:])
+            return r.stdout.strip()
+
+          def log(msg):
+            print(msg, flush=True)
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(msg + "\n")
+
+          open_issues = json.loads(gh("issue", "list", "--label", LABEL,
+                                       "--state", "open", "--json", "number,url") or "[]")
+          issue = open_issues[0] if open_issues else None
+
+          def comment(num, body):
+            subprocess.run(["gh", "issue", "comment", str(num), "--body", body], check=True)
+
+          def start_client(logfile="/tmp/sb-verify.log"):
+            subprocess.run(["pkill", "-f", "sb-client.json"])
+            time.sleep(2)
+            subprocess.Popen(["/tmp/sing-box-bin", "run", "-c", "/tmp/sb-client.json"],
+                             stdout=open(logfile, "w"),
+                             stderr=subprocess.STDOUT, start_new_session=True)
+            time.sleep(5)
+
+          def stop_client():
+            subprocess.run(["pkill", "-f", "sb-client.json"])
+
+          def curl_probe():
+            try:
+              r = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-x", "http://127.0.0.1:2080", "--max-time", "20", TARGET],
+                capture_output=True, text=True, timeout=30)
+              return r.stdout.strip()
+            except Exception:
+              return "000"
+
+          def probe_rounds(n, tag, interval):
+            fails = 0
+            for i in range(1, n + 1):
+              code = curl_probe()
+              log(f"{tag} round {i}/{n}: HTTP {code}")
+              if code != "200":
+                fails += 1
+              if i < n:
+                time.sleep(interval)
+            return fails
+
+          healthy = FAIL < TH and not FORCE
+          if healthy:
+            log(f"healthy ({FAIL}/{os.environ['PROBE_ROUNDS']} failed), no action")
+            if issue:
+              comment(issue["number"], f"巡检恢复：本轮 {FAIL}/{os.environ['PROBE_ROUNDS']} 失败，自动关闭。")
+              subprocess.run(["gh", "issue", "close", str(issue["number"])], check=True)
+              log(f"closed {issue['url']}")
+            return
+
+          # unhealthy (or forced): ensure tracking issue exists
+          if not issue:
+            url = gh("issue", "create", "--title", "[proxy-health] vm-proxy 拨测失败",
+                     "--label", LABEL, "--body",
+                     f"深度拨测 {FAIL}/{os.environ['PROBE_ROUNDS']} 轮失败（阈值 {TH}），"
+                     f"目标 {TARGET}。本 issue 为自动巡检的状态记录。")
+            issue = {"number": url.rsplit("/", 1)[-1], "url": url}
+            log(f"opened {url}")
+
+          num = issue["number"]
+          # cooldown: skip reboot if one was triggered within COOLDOWN
+          comments = json.loads(gh("issue", "view", str(num), "--comments",
+                                   "--json", "comments") or '{"comments":[]}')["comments"]
+          import datetime
+          now = datetime.datetime.now(datetime.timezone.utc)
+          recent = False
+          for c in comments:
+            if "RESET reboot triggered" in c.get("body", ""):
+              ts = datetime.datetime.fromisoformat(
+                c["createdAt"].replace("Z", "+00:00"))
+              if (now - ts).total_seconds() < COOLDOWN:
+                recent = True
+          if recent and not FORCE:
+            comment(num, "24 小时内已重启过一次，冷却中，本次跳过重启。")
+            log("cooldown active, reboot skipped")
+            return
+
+          comment(num, f"拨测 {FAIL}/{os.environ['PROBE_ROUNDS']} 失败，执行 RESET 重启 vm-proxy。")
+          log(f"RESET reboot {IID}")
+          oci("compute", "instance", "action", "--action", "RESET",
+              "--instance-id", IID)
+          comment(num, f"RESET reboot triggered at {now:%Y-%m-%dT%H:%M:%SZ}，等待 5 分钟后验证。")
+          time.sleep(300)
+
+          # restart local probe client config already on disk; re-verify
+          start_client()
+          vfails = probe_rounds(int(os.environ["VERIFY_ROUNDS"]), "verify", 60)
+          stop_client()
+          if vfails == 0:
+            comment(num, "重启后验证通过，自动关闭。")
+            subprocess.run(["gh", "issue", "close", str(num)], check=True)
+            log("recovered, issue closed")
+          else:
+            comment(num, f"重启后验证仍失败（{vfails}/{os.environ['VERIFY_ROUNDS']}），"
+                         "请人工介入。@xieyucheng123")
+            log("STILL FAILING after reboot, needs human")
+            raise SystemExit(1)
+          EOF
